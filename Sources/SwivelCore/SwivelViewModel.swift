@@ -32,6 +32,9 @@ struct UIActions {
     var switchTo: (String) -> Void = { _ in }
     var flip: () -> Void = {}
     var addAccount: () -> Void = {}
+    var addAnotherAccount: () -> Void = {}
+    var finishPendingAccount: () -> Void = {}
+    var cancelPendingAccount: () -> Void = {}
     var updateCurrent: () -> Void = {}
     var rename: (String) -> Void = { _ in }
     var delete: (String) -> Void = { _ in }
@@ -64,6 +67,10 @@ final class SwivelViewModel: ObservableObject {
     /// Opt-in: fetch live usage from claude.ai. Off by default. Persisted
     /// in UserDefaults; mirrored here so the toggle's checkmark updates.
     @Published var liveUsageEnabled = UserDefaults.standard.bool(forKey: liveUsageDefaultsKey)
+    /// Non-nil while the user is signing in to a new account through the
+    /// safe "Add Another Account" flow. Drives the popover banner's
+    /// Finish / Cancel controls.
+    @Published private(set) var pendingAccountName: String?
 
     static let liveUsageDefaultsKey = "liveUsageEnabled"
 
@@ -158,5 +165,12 @@ final class SwivelViewModel: ObservableObject {
         liveUsageEnabled = on
         UserDefaults.standard.set(on, forKey: Self.liveUsageDefaultsKey)
         refresh()
+    }
+
+    /// AppDelegate owns the setup lifecycle; mirror the pending account
+    /// name so SwiftUI can render the Finish / Cancel banner.
+    func setPendingAccountName(_ name: String?) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        pendingAccountName = name
     }
 }

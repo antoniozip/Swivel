@@ -41,10 +41,12 @@ open /Applications/Swivel.app
 
 1. Sign into your first Claude account in Claude Desktop.
 2. Menu bar icon → **Add Account…** → name it (e.g. *Personal*).
-3. Sign out. Sign into your second account.
-4. **Add Account…** → *Work*.
+3. Open the popover → **Add Another Account…** → name the second one (e.g. *Work*). Swivel saves the current session, quits Claude, and reopens it on the sign-in screen.
+4. Sign in to the new account in Claude, then press **Finish** in the Swivel popover. Changed your mind? **Cancel** restores the account you started from.
 
 You now have two accounts. **Press `⌘⌥1` or `⌘⌥2`** to switch — or open the popover and hit a row's **⇄** button. Claude quits, the session swaps, Claude relaunches. The round trip is usually under two seconds.
+
+> **Never use Claude's own Sign out to switch accounts.** Signing out revokes that session on Anthropic's servers, so the snapshot Swivel saved can no longer authenticate — even though its cookies are intact. **Add Another Account…** exists to avoid this: it signs the new account in locally without logging the old one out anywhere.
 
 ## Shortcuts
 
@@ -64,6 +66,7 @@ Click the menu bar icon to open a translucent glass popover:
 - **Last used** — a persistent "flip back" row. Faster than re-picking.
 - **Save snapshot** (the save icon in the usage header) — re-saves the *current* account from Claude's live state. Run it occasionally so your saved profile keeps up with recent chats.
 - **Add Account…** — save the current Claude session as a new account.
+- **Add Another Account…** — sign in to a second account without using Claude's Sign out. Swivel saves the current session, relaunches Claude on its sign-in screen, and shows a **Finish / Cancel** banner until you're done. **Finish** saves the newly signed-in account; **Cancel** restores the previous one.
 - **Gear menu** — Launch at Login, the Usage Overlay toggle, the Live Usage toggle, Check for Updates…, Help, About, Quit.
 
 Right-click the menu bar icon for a compact About / Check for Updates / Quit menu.
@@ -132,6 +135,14 @@ The snapshot's manifest doesn't match its files — usually from disk corruption
 </details>
 
 <details>
+<summary><strong>A saved account won't switch after I used Claude's Sign out</strong></summary>
+
+Claude's **Sign out** revokes the session on Anthropic's servers. Swivel's snapshot still has the cookies and decryption key, but the server no longer accepts that session, so switching to it lands on a signed-out Claude.
+
+**Fix:** sign back into that account in Claude, then re-save it with **Add Account…** (same name, confirm overwrite) or the save button in the usage header. For future accounts, use **Add Another Account…** instead of Sign out.
+</details>
+
+<details>
 <summary><strong>Keychain prompts on every switch</strong></summary>
 
 The first save of each account reads the Claude keychain key. If you didn't click **Always Allow** at that prompt, every subsequent read re-prompts.
@@ -182,6 +193,16 @@ On **switch**, Swivel:
 
 Claude Code CLI state (`claude-code*` folders) is deliberately left in place — your terminal sessions aren't tied to the GUI account.
 
+### Adding another account without signing out
+
+**Add Another Account…** follows the same idea, without calling Claude's logout endpoint:
+1. Saves the current session to its profile, exactly like **Add Account…**.
+2. Quits Claude and clears only the non-excluded items in Claude's data folder (session cookies, config, local storage). Claude Code state, caches and VM bundles stay in place.
+3. Relaunches Claude, which now shows its sign-in screen. The previous account's session is untouched on Anthropic's side.
+4. When you press **Finish**, Swivel checks that a claude.ai session cookie is present, saves the newly signed-in session as the new account, and relaunches Claude. **Cancel** instead restores the previous profile.
+
+The setup is recorded in `pending-setup.json`, so quitting Swivel (or a crash) between steps 3 and 4 still leaves Finish and Cancel available on next launch.
+
 Full internals in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Requirements
@@ -193,6 +214,7 @@ Full internals in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 ## Limitations
 
 - Don't edit Claude Desktop while a switch is in progress. The menu bar icon dims while work is in flight — wait for it to brighten.
+- Never use Claude's **Sign out** to move between accounts. Use **Add Another Account…** (or **Add Account…** after signing in normally); Sign out revokes the saved session server-side.
 - Keychain key rotation (rare — happens when Claude Desktop is fully reinstalled) invalidates saved cookies. Affected accounts must be re-saved.
 - Live Usage is experimental: it reads undocumented `claude.ai` endpoints, so it can break without warning. It's off by default and the local-cache bars work regardless.
 - Builds you compile yourself are ad-hoc signed unless you have a Developer ID certificate installed — that's fine locally, but macOS will warn if you move one to another Mac.

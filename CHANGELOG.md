@@ -6,6 +6,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Add Another Account…** — a safe way to sign in to a second account
+  without using Claude's Sign out. Swivel saves the current session, quits
+  Claude, reopens it on the sign-in screen, then saves the new account on
+  **Finish**. **Cancel** restores the account you started from. The setup
+  survives a Swivel relaunch, and switching/mutating accounts is blocked
+  until it's finished or cancelled.
+
+### Changed
+
+- The README setup instructions now use **Add Another Account…** and warn
+  that Claude's own Sign out revokes the saved session server-side.
+
+### Fixed
+
+- Snapshots no longer include Claude's transient `config.json.journal`
+  crash-recovery file, which a restore could otherwise make Claude roll
+  back.
+- Successful saves now remove their empty `.staging-*` directory instead
+  of leaving it behind.
+
 ## [1.1.1] — 2026-08-23
 
 ### Added

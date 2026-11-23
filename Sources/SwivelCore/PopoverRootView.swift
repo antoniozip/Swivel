@@ -29,6 +29,10 @@ struct PopoverRootView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
+            if let pending = model.pendingAccountName {
+                pendingBanner(pending)
+            }
+
             if let status = model.serviceStatus,
                status.level != .none, status.level != .unknown {
                 statusBanner(status)
@@ -50,6 +54,44 @@ struct PopoverRootView: View {
         // legibility scrim on top so the muted row text stays readable over
         // a bright wallpaper — same fix as the overlay.
         .glassLegibilityScrim()
+    }
+
+    // MARK: - Pending account banner
+
+    /// Shown between "Add Another Account…" and Finish/Cancel. The live
+    /// Claude install is on its sign-in screen during this window; the
+    /// account the user came from is safely saved and one click away via
+    /// Cancel.
+    private func pendingBanner(_ name: String) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "person.crop.circle.badge.checkmark")
+                    .font(.system(size: 12, weight: .medium))
+                Text("Adding \(name)")
+                    .font(.system(size: 12, weight: .semibold))
+                Spacer()
+            }
+            Text("Sign in to \(name) in Claude, then finish. Do not use Claude's Sign out.")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 8) {
+                Button("Finish", action: actions.finishPendingAccount)
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                Button("Cancel", action: actions.cancelPendingAccount)
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                Spacer()
+            }
+        }
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.accentColor.opacity(0.12))
+        )
+        .padding(.horizontal, 10)
+        .padding(.top, 10)
     }
 
     // MARK: - Status banner
@@ -120,9 +162,12 @@ struct PopoverRootView: View {
                 flipRow(prev)
             }
 
-            addAccountRow
-                .padding(.top, 2)
-                .padding(.bottom, 8)
+            if model.pendingAccountName == nil {
+                addAccountRow
+                    .padding(.top, 2)
+                addAnotherAccountRow
+                    .padding(.bottom, 8)
+            }
         }
     }
 
@@ -167,6 +212,28 @@ struct PopoverRootView: View {
         .help("Save the current Claude session as a new account")
     }
 
+    /// The safe second-account path: Swivel saves the current session,
+    /// relaunches Claude on its sign-in screen without calling logout, and
+    /// waits for the user to sign in and press Finish.
+    private var addAnotherAccountRow: some View {
+        Button(action: actions.addAnotherAccount) {
+            HStack(spacing: 8) {
+                Image(systemName: "person.badge.plus")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                Text("Add Another Account…")
+                    .font(.system(size: 12))
+                Spacer()
+            }
+            .padding(.vertical, 4)
+            .padding(.horizontal, 6)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(HoverHighlightButtonStyle())
+        .padding(.horizontal, 8)
+        .help("Sign in to another account without signing out of this one")
+    }
+
     // MARK: - Onboarding (zero accounts)
 
     private var onboarding: some View {
@@ -180,7 +247,7 @@ struct PopoverRootView: View {
             VStack(alignment: .leading, spacing: 6) {
                 Text("1. Sign into your Claude account")
                 Text("2. Save this session as an account")
-                Text("3. Sign out, sign into another, save that too")
+                Text("3. Use Add Another Account… for a second one — no Sign out")
                 Text("Then: ⌘⌥1 / ⌘⌥2 to switch any time")
             }
             .font(.system(size: 12))

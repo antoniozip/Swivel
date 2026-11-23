@@ -27,8 +27,44 @@ struct ProfileManagerTests {
         try "x".write(to: dir.appendingPathComponent("marker"), atomically: true, encoding: .utf8)
     }
 
+    private var swivelRoot: URL {
+        home.appendingPathComponent("Library/Application Support/Swivel")
+    }
+
+    private var liveClaude: URL {
+        home.appendingPathComponent("Library/Application Support/Claude")
+    }
+
     private func cleanup() {
         try? FileManager.default.removeItem(at: home)
+    }
+
+    /// Point state.json at an active profile without the keychain-coupled
+    /// save path.
+    private func setActive(_ name: String) throws {
+        try FileManager.default.createDirectory(at: swivelRoot, withIntermediateDirectories: true)
+        let data = try JSONSerialization.data(withJSONObject: ["activeProfile": name])
+        try data.write(to: swivelRoot.appendingPathComponent("state.json"), options: .atomic)
+    }
+
+    /// A live Claude folder with session-critical files, a transient journal,
+    /// and excluded Claude Code / cache state.
+    private func makeLiveSession() throws {
+        let fm = FileManager.default
+        try fm.createDirectory(at: liveClaude, withIntermediateDirectories: true)
+        for file in ["Cookies", "config.json", "config.json.journal"] {
+            try "live".write(
+                to: liveClaude.appendingPathComponent(file),
+                atomically: true,
+                encoding: .utf8
+            )
+        }
+        let codeDir = liveClaude.appendingPathComponent("claude-code")
+        try fm.createDirectory(at: codeDir, withIntermediateDirectories: true)
+        try "session".write(to: codeDir.appendingPathComponent("session"), atomically: true, encoding: .utf8)
+        let cacheDir = liveClaude.appendingPathComponent("Cache")
+        try fm.createDirectory(at: cacheDir, withIntermediateDirectories: true)
+        try "cache".write(to: cacheDir.appendingPathComponent("blob"), atomically: true, encoding: .utf8)
     }
 
     @Test func colorRoundTrip() throws {
@@ -142,5 +178,83 @@ struct ProfileManagerTests {
         try fm.createDirectory(at: orphan, withIntermediateDirectories: true)
         _ = ProfileManager(home: home)
         #expect(fm.fileExists(atPath: orphan.path) == false)
+    }
+
+    // MARK: - Add Another Account
+
+    @Test func validateNewProfileNameTrimsAndRejectsDuplicates() throws {
+        defer { cleanup() }
+        try makeProfile("Work")
+        #expect(try manager.validateNewProfileName("  Personal  ") == "Personal")
+        #expect(throws: ProfileError.self) { try manager.validateNewProfileName("Work") }
+        #expect(throws: ProfileError.self) { try manager.validateNewProfileName("   ") }
+        #expect(throws: ProfileError.self) { try manager.validateNewProfileName("../evil") }
+    }
+
+    @Test func prepareRefusesExistingNameWithoutTouchingLiveSession() throws {
+        defer { cleanup() }
+        try makeProfile("Personal")
+        try setActive("Personal")
+        try makeLiveSession()
+
+        #expect(throws: ProfileError.self) {
+            try manager.prepareForFreshSignIn(named: "Personal", previousActive: "Personal")
+        }
+        #expect(FileManager.default.fileExists(atPath: liveClaude.appendingPathComponent("Cookies").path))
+        #expect(manager.loadPendingSetup() == nil)
+    }
+
+    @Test func addAnotherAccountPreparesFreshSignInAndCancelRestores() throws {
+        defer { cleanup() }
+        let fm = FileManager.default
+        try makeProfile("Personal")
+        try setActive("Personal")
+        try makeLiveSession()
+
+        let pending = try manager.prepareForFreshSignIn(
+            named: "  Work  ",
+            previousActive: "Personal"
+        )
+        #expect(pending.name == "Work")
+        #expect(pending.previousActive == "Personal")
+        #expect(manager.loadPendingSetup()?.name == "Work")
+        #expect(manager.activeProfile() == "Personal")
+        #expect(fm.fileExists(atPath: swivelRoot.appendingPathComponent("pending-setup.json").path))
+
+        // The save succeeded, so its staging directory is gone.
+        let profileDir = swivelRoot.appendingPathComponent("profiles/Personal")
+        let profileEntries = try fm.contentsOfDirectory(atPath: profileDir.path)
+        #expect(profileEntries.contains { $0.hasPrefix(".staging-") } == false)
+
+        // Session-critical files are cleared so Claude shows its sign-in
+        // screen; the transient journal is cleared too. Excluded items stay.
+        #expect(!fm.fileExists(atPath: liveClaude.appendingPathComponent("Cookies").path))
+        #expect(!fm.fileExists(atPath: liveClaude.appendingPathComponent("config.json").path))
+        #expect(!fm.fileExists(atPath: liveClaude.appendingPathComponent("config.json.journal").path))
+        #expect(fm.fileExists(atPath: liveClaude.appendingPathComponent("claude-code/session").path))
+        #expect(fm.fileExists(atPath: liveClaude.appendingPathComponent("Cache/blob").path))
+
+        // The marker survives a relaunch…
+        let reopened = ProfileManager(home: home)
+        #expect(reopened.loadPendingSetup()?.name == "Work")
+
+        // Preparing refreshed the outgoing profile from the live session
+        // before clearing it, so Cancel restores that state (not the older
+        // marker-only snapshot). The journal stays out of both.
+        let savedSnapshot = try #require(manager.snapshotClaudeDir(for: "Personal"))
+        #expect(fm.fileExists(atPath: savedSnapshot.appendingPathComponent("Cookies").path))
+        #expect(!fm.fileExists(atPath: savedSnapshot.appendingPathComponent("config.json.journal").path))
+        #expect(manager.listBackups(for: "Personal").count == 1)
+
+        // …and Cancel restores the saved previous profile and clears it.
+        try reopened.restorePendingSetup(previousActive: "Personal")
+        #expect(fm.fileExists(atPath: liveClaude.appendingPathComponent("Cookies").path))
+        #expect(fm.fileExists(atPath: liveClaude.appendingPathComponent("config.json").path))
+        #expect(!fm.fileExists(atPath: liveClaude.appendingPathComponent("config.json.journal").path))
+        #expect(fm.fileExists(atPath: liveClaude.appendingPathComponent("claude-code/session").path))
+        #expect(reopened.loadPendingSetup() == nil)
+        #expect(!fm.fileExists(atPath: swivelRoot.appendingPathComponent("pending-setup.json").path))
+        let leftovers = try fm.contentsOfDirectory(atPath: swivelRoot.path)
+        #expect(leftovers.contains { $0.hasPrefix(".restore-staging-") } == false)
     }
 }

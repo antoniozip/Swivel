@@ -5,6 +5,7 @@ enum ProfileError: LocalizedError {
     case claudeDirMissing
     case profileNotFound(String)
     case invalidName(String)
+    case nameTaken(String)
     case keychainReadFailed(String)
     case claudeDidNotQuit
     case ioFailure(String)
@@ -16,6 +17,7 @@ enum ProfileError: LocalizedError {
         case .claudeDirMissing: return "Claude Desktop directory not found. Launch Claude at least once first."
         case .profileNotFound(let n): return "Profile \"\(n)\" not found."
         case .invalidName(let n): return "Invalid profile name: \(n)"
+        case .nameTaken(let n): return "An account named \"\(n)\" already exists."
         case .keychainReadFailed(let m): return "Keychain read failed: \(m)"
         case .claudeDidNotQuit: return "Claude Desktop did not quit in time. Please close it manually and try again."
         case .ioFailure(let m): return "File operation failed: \(m)"
@@ -33,6 +35,16 @@ struct BackupInfo {
     let date: Date
 }
 
+/// A safe "add another account" session in progress. Persisted so a
+/// relaunch can still finish or cancel the setup: the live Claude folder
+/// has been cleared to the sign-in screen, while `previousActive` still
+/// holds the saved session that Cancel restores.
+struct PendingAccountSetup: Codable {
+    let name: String
+    let previousActive: String
+    let startedAt: Date
+}
+
 final class ProfileManager {
     private let fm = FileManager.default
     private let home: URL
@@ -44,6 +56,7 @@ final class ProfileManager {
     private let rootDir: URL
     private let profilesDir: URL
     private let stateFile: URL
+    private let pendingSetupFile: URL
 
     // How many historical snapshots to keep per profile (in addition to
     // the current `Claude/` dir). Set low since each snapshot can be 100+MB.
@@ -71,6 +84,14 @@ final class ProfileManager {
     // install never sees it.
     private static let manifestFileName = ".swivel-manifest.json"
     private static let manifestVersion = 1
+
+    // Files Claude writes as transient crash-recovery journals while it is
+    // running. A snapshot captured mid-write can contain one of these, and
+    // restoring it can make Claude roll its config back on the next launch.
+    // They are never part of a snapshot.
+    private static let transientSnapshotItems: Set<String> = [
+        "config.json.journal"
+    ]
 
     // Items inside the Claude folder we explicitly do NOT copy during
     // snapshot, and do NOT wipe during restore. Falls into three groups:
@@ -132,6 +153,7 @@ final class ProfileManager {
 
         self.profilesDir = rootDir.appendingPathComponent("profiles")
         self.stateFile = rootDir.appendingPathComponent("state.json")
+        self.pendingSetupFile = rootDir.appendingPathComponent("pending-setup.json")
         do {
             try fm.createDirectory(at: profilesDir, withIntermediateDirectories: true)
         } catch {
@@ -241,6 +263,171 @@ final class ProfileManager {
             try snapshotKeychainKey(into: target)
             pruneBackups(in: target)
         }
+    }
+
+    // MARK: - Safe add-another-account setup
+
+    /// Validate a name for a *new* account. Unlike `saveCurrent`, this
+    /// refuses existing names: "Add Another Account" must never overwrite
+    /// the profile it is switching away from.
+    func validateNewProfileName(_ name: String) throws -> String {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        try validateName(trimmed)
+        if listProfiles().contains(trimmed) {
+            throw ProfileError.nameTaken(trimmed)
+        }
+        return trimmed
+    }
+
+    /// The in-progress "Add Another Account" session, if one survives a
+    /// relaunch. Cleared automatically if the new profile was already saved
+    /// (a crash between saving and removing the marker).
+    func loadPendingSetup() -> PendingAccountSetup? {
+        guard let data = try? Data(contentsOf: pendingSetupFile),
+              let pending = try? JSONDecoder().decode(PendingAccountSetup.self, from: data)
+        else { return nil }
+        if fm.fileExists(atPath: profilesDir.appendingPathComponent(pending.name).path) {
+            clearPendingSetup()
+            return nil
+        }
+        return pending
+    }
+
+    /// Save the current live session as `previousActive`, then clear every
+    /// non-excluded item from Claude's data directory so the next launch
+    /// shows the sign-in screen. Claude must already be quit. Excluded
+    /// items (Claude Code state, caches, VM bundles) stay in place.
+    ///
+    /// This deliberately does not call Claude's logout endpoint: the goal
+    /// is a fresh local sign-in while the saved session stays valid on
+    /// Anthropic's side.
+    func prepareForFreshSignIn(
+        named newName: String,
+        previousActive: String
+    ) throws -> PendingAccountSetup {
+        let trimmed = try validateNewProfileName(newName)
+        guard activeProfile() == previousActive else {
+            throw ProfileError.ioFailure("The active account changed while preparing the sign-in.")
+        }
+        guard fm.fileExists(atPath: claudeDir.path) else { throw ProfileError.claudeDirMissing }
+        // Refuse to overwrite the outgoing snapshot with a signed-out state.
+        // nil (store not inspectable) is not treated as signed out.
+        if liveSessionCookiePresent() == false {
+            throw ProfileError.ioFailure(
+                "Claude doesn't look signed in. Sign in to \(previousActive) before adding another account."
+            )
+        }
+
+        let pending = PendingAccountSetup(
+            name: trimmed,
+            previousActive: previousActive,
+            startedAt: Date()
+        )
+
+        return try tryLocked {
+            // Refresh the outgoing profile from the live session before it's
+            // cleared. Without this, Cancel would rewind the user to their
+            // last save and silently lose anything since. The saved keychain
+            // key is already on this profile and the device key never
+            // rotates, so don't re-read it here.
+            let previousDir = profilesDir.appendingPathComponent(previousActive)
+            try rotateBackupIfPresent(in: previousDir)
+            try snapshotClaudeFolder(into: previousDir)
+            pruneBackups(in: previousDir)
+
+            // Write the marker before clearing: if the clear is interrupted,
+            // the next launch still knows how to cancel and restore the
+            // previous profile.
+            let data = try JSONEncoder().encode(pending)
+            try data.write(to: pendingSetupFile, options: .atomic)
+
+            let entries = try fm.contentsOfDirectory(
+                at: claudeDir,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            )
+            for entry in entries {
+                let itemName = entry.lastPathComponent
+                if excludedItems.contains(itemName) || itemName == Self.manifestFileName { continue }
+                do {
+                    try fm.removeItem(at: entry)
+                } catch {
+                    throw ProfileError.ioFailure(
+                        "clearing the previous Claude session (\(itemName)): \(error.localizedDescription)"
+                    )
+                }
+            }
+            Self.log.info("prepared fresh sign-in for \(trimmed, privacy: .public)")
+            return pending
+        }
+    }
+
+    /// Restore the account that was active before an "Add Another Account"
+    /// flow. Used by Cancel, and safe after a relaunch: the previous
+    /// profile is the only source of the live session (the fresh one was
+    /// never saved).
+    func restorePendingSetup(previousActive: String) throws {
+        let target = profilesDir.appendingPathComponent(previousActive)
+        guard fm.fileExists(atPath: target.path) else {
+            throw ProfileError.profileNotFound(previousActive)
+        }
+        try tryLocked {
+            try restoreClaudeFolder(from: target)
+            try? fm.removeItem(at: pendingSetupFile)
+        }
+    }
+
+    /// Remove the "setup in progress" marker after Finish or Cancel.
+    func clearPendingSetup() {
+        do {
+            if fm.fileExists(atPath: pendingSetupFile.path) {
+                try fm.removeItem(at: pendingSetupFile)
+            }
+        } catch {
+            Self.log.error("pending setup cleanup failed: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    /// Whether Claude's live cookie store currently has a claude.ai
+    /// session cookie. Used by Finish to avoid saving a signed-out profile.
+    /// nil means the store couldn't be inspected — callers should not block.
+    func liveSessionCookiePresent() -> Bool? {
+        let cookies = claudeDir.appendingPathComponent("Cookies")
+        guard fm.fileExists(atPath: cookies.path) else { return false }
+
+        let tmp = NSTemporaryDirectory() + "swivel-session-probe-\(UUID().uuidString).db"
+        defer {
+            try? fm.removeItem(atPath: tmp)
+            try? fm.removeItem(atPath: tmp + "-wal")
+            try? fm.removeItem(atPath: tmp + "-shm")
+        }
+        guard (try? fm.copyItem(atPath: cookies.path, toPath: tmp)) != nil else { return nil }
+        // Chromium keeps recent writes in the WAL; copy the sidecars too so
+        // a sign-in completed moments ago is visible to the probe.
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = cookies.path + suffix
+            if fm.fileExists(atPath: sidecar) {
+                try? fm.copyItem(atPath: sidecar, toPath: tmp + suffix)
+            }
+        }
+        try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tmp)
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
+        proc.arguments = [
+            tmp,
+            "select count(*) from cookies where name='sessionKey' and host_key like '%claude.ai%';"
+        ]
+        let out = Pipe()
+        proc.standardOutput = out
+        proc.standardError = Pipe()
+        guard (try? proc.run()) != nil else { return nil }
+        proc.waitUntilExit()
+        guard proc.terminationStatus == 0 else { return nil }
+        let text = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let text, let count = Int(text) else { return nil }
+        return count > 0
     }
 
     /// Rename an account. Moves the on-disk profile directory and updates
@@ -377,11 +564,10 @@ final class ProfileManager {
         let staging = profileDir.appendingPathComponent(".staging-\(stagingID)")
         try fm.createDirectory(at: staging, withIntermediateDirectories: true)
         // Ensure the staging dir is cleaned up on ANY exit path — success
-        // (in which case it's already empty) or failure (in which case we
-        // want to reclaim the partial data).
-        var stagingReleased = false
+        // (in which case the promoted entries are gone and the directory is
+        // empty) or failure (in which case we want to reclaim partial data).
         defer {
-            if !stagingReleased, fm.fileExists(atPath: staging.path) {
+            if fm.fileExists(atPath: staging.path) {
                 do {
                     try fm.removeItem(at: staging)
                 } catch {
@@ -402,7 +588,7 @@ final class ProfileManager {
         )
         for entry in entries {
             let name = entry.lastPathComponent
-            if excludedItems.contains(name) { continue }
+            if excludedItems.contains(name) || Self.transientSnapshotItems.contains(name) { continue }
             let dest = stagedClaude.appendingPathComponent(name)
             do {
                 try fm.copyItem(at: entry, to: dest)
@@ -452,8 +638,6 @@ final class ProfileManager {
             let liveProfilePlist = profileDir.appendingPathComponent("com.anthropic.claudefordesktop.plist")
             try atomicPromote(staged: plistStaged, to: liveProfilePlist)
         }
-
-        stagingReleased = true
     }
 
     /// Restore a profile's saved session over the live Claude install.
@@ -493,10 +677,11 @@ final class ProfileManager {
         var stagedNames: Set<String> = []
         let snapEntries = try fm.contentsOfDirectory(at: snapshotDir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
         for entry in snapEntries {
-            // Manifest file is our own bookkeeping — never propagate it into
+            // Manifest file is our own bookkeeping, and transient journals
+            // are live-write artifacts — never propagate either into
             // Claude's live directory.
-            if entry.lastPathComponent == Self.manifestFileName { continue }
             let name = entry.lastPathComponent
+            if name == Self.manifestFileName || Self.transientSnapshotItems.contains(name) { continue }
             do {
                 try fm.copyItem(at: entry, to: staging.appendingPathComponent(name))
             } catch {
@@ -676,7 +861,7 @@ final class ProfileManager {
         )
         for child in children {
             let name = child.lastPathComponent
-            if name == Self.manifestFileName { continue }
+            if name == Self.manifestFileName || Self.transientSnapshotItems.contains(name) { continue }
             entries.append("Claude/\(name)")
         }
 

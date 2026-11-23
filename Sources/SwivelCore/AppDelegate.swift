@@ -44,6 +44,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItemController: StatusItemController?
     private var widgetController: DesktopWidgetController?
 
+    // The "Add Another Account" setup session, if one is in progress.
+    // Persisted by ProfileManager so it survives a Swivel relaunch (and a
+    // crash mid-flow), since the live Claude install is sitting on its
+    // sign-in screen until the user finishes or cancels.
+    private var pendingSetup: PendingAccountSetup?
+    private var isPreparingAccount = false
+
     // Sparkle handles auto-update end to end: it reads our appcast on
     // a background schedule, downloads the new build, verifies the
     // EdDSA signature against `SUPublicEDKey` from Info.plist, then
@@ -111,6 +118,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         widgetController = widget
         widget.restoreFromDefaults()
 
+        restorePendingSetupState()
         refreshUI()
 
         // Start polling Anthropic's public status page. On each update:
@@ -190,6 +198,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         switcher.performSwitch(
             to: name,
             preflight: {
+                guard self.ensureNoAccountSetupInProgress() else { return false }
                 if self.manager.activeProfile() == nil {
                     let confirm = Dialogs.confirm(
                         title: "No active account set",
@@ -332,7 +341,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func refreshTitle() {
         guard let button = statusItem.button else { return }
         button.title = ""
-        if let name = manager.activeProfile() {
+        if let pending = pendingSetup {
+            button.toolTip = "Swivel — adding \(pending.name)…"
+        } else if let name = manager.activeProfile() {
             button.toolTip = "Swivel — active: \(name)"
         } else {
             button.toolTip = "Swivel — no account selected"
@@ -369,6 +380,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         actions.flip = closing { [weak self] in self?.handleFlip() }
         actions.addAccount = closing { [weak self] in self?.handleAddAccount() }
+        actions.addAnotherAccount = closing { [weak self] in self?.handleAddAnotherAccount() }
+        actions.finishPendingAccount = closing { [weak self] in self?.handleFinishPendingAccount() }
+        actions.cancelPendingAccount = closing { [weak self] in self?.handleCancelPendingAccount() }
         actions.updateCurrent = closing { [weak self] in self?.handleUpdateCurrent() }
         actions.rename = { [weak self] name in
             self?.statusItemController?.closePopover()
@@ -428,6 +442,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func handleAddAccount() {
+        guard ensureNoAccountSetupInProgress() else { return }
         guard let name = Dialogs.prompt(
             title: "Add Account",
             message: "Name this account (for example \"Personal\" or \"Work\"):",
@@ -444,17 +459,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         do {
             try manager.saveCurrent(as: trimmed)
-            // Auto-assign the next unused preset color so new accounts show
-            // up with a distinct identity immediately, without forcing the
-            // user to navigate a submenu.
-            if manager.profileColorHex(for: trimmed) == nil {
-                let used = manager.assignedColorHexes()
-                let pick = MenuStyle.colorPresets.first { !used.contains($0.hex.uppercased()) }
-                    ?? MenuStyle.colorPresets.first
-                if let hex = pick?.hex {
-                    try? manager.setProfileColorHex(hex, for: trimmed)
-                }
-            }
+            assignAutoColorIfNeeded(to: trimmed)
             statusItem.button?.image = currentStatusIcon()
             refreshUI()
             registerHotkeys()
@@ -464,7 +469,243 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    // MARK: - Add Another Account setup
+
+    /// The safe second-account path. Instead of asking the user to sign out
+    /// (which revokes the current session on Anthropic's servers and can
+    /// invalidate the snapshot Swivel just saved), save the current session,
+    /// quit Claude, clear only its local session data, and relaunch it on the
+    /// sign-in screen. The saved session stays valid; Cancel can restore it.
+    @objc func handleAddAnotherAccount() {
+        guard ensureNoAccountSetupInProgress() else { return }
+        guard let active = manager.activeProfile() else {
+            Dialogs.alert(
+                "Save an account first",
+                style: .informational,
+                detail: "Add Another Account protects the session you're signed into now, so Swivel needs it saved first. Use Add Account… to save it, then try again."
+            )
+            return
+        }
+        guard let rawName = Dialogs.prompt(
+            title: "Add Another Account",
+            message: "Name the account you're about to sign in to (for example \"Work\"):",
+            actionTitle: "Continue"
+        ) else { return }
+
+        let name: String
+        do {
+            name = try manager.validateNewProfileName(rawName)
+        } catch {
+            Dialogs.alert("Couldn't add account", style: .warning, detail: error.localizedDescription)
+            return
+        }
+
+        guard Dialogs.confirm(
+            title: "Sign in to \(name)?",
+            message: "Swivel will save \(active), quit Claude, and reopen it on the sign-in screen. \(active) stays saved and signed in — do not use Claude's Sign out. When you've signed in to \(name), press Finish in the Swivel popover.",
+            confirmTitle: "Save & Continue"
+        ) else { return }
+
+        isPreparingAccount = true
+        statusItemController?.closePopover()
+        statusItem.button?.toolTip = "Preparing to add \(name)…"
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            let outcome: Result<PendingAccountSetup, Error>
+            do {
+                ClaudeAppController.quit()
+                guard ClaudeAppController.waitUntilQuit(timeout: 10) else {
+                    throw ProfileError.claudeDidNotQuit
+                }
+                let pending = try self.manager.prepareForFreshSignIn(
+                    named: name,
+                    previousActive: active
+                )
+                ClaudeAppController.launch()
+                outcome = .success(pending)
+            } catch {
+                ClaudeAppController.launch()
+                outcome = .failure(error)
+            }
+            DispatchQueue.main.async {
+                self.isPreparingAccount = false
+                self.clearSwitchingUI()
+                switch outcome {
+                case .success(let pending):
+                    self.pendingSetup = pending
+                    self.viewModel.setPendingAccountName(pending.name)
+                    self.refreshUI()
+                    Dialogs.notify(
+                        title: "Sign in to \(pending.name)",
+                        body: "Claude is open on its sign-in screen. When you're signed in, press Finish in Swivel. Don't use Claude's Sign out."
+                    )
+                case .failure(let error):
+                    Dialogs.alert(
+                        "Couldn't start adding account",
+                        style: .critical,
+                        detail: error.localizedDescription
+                    )
+                }
+            }
+        }
+    }
+
+    /// Save the freshly signed-in session as the new account, then reopen
+    /// Claude on it. Refuses when the live cookie store has no claude.ai
+    /// session, so a signed-out state can't overwrite a good snapshot.
+    @objc func handleFinishPendingAccount() {
+        guard let pending = pendingSetup, !isPreparingAccount else { return }
+
+        if manager.liveSessionCookiePresent() == false {
+            Dialogs.alert(
+                "Claude isn't signed in yet",
+                style: .informational,
+                detail: "Sign in to \(pending.name) in Claude, then press Finish again. If you just finished signing in, give Claude a moment and retry."
+            )
+            return
+        }
+
+        isPreparingAccount = true
+        statusItemController?.closePopover()
+        statusItem.button?.toolTip = "Saving \(pending.name)…"
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            let outcome: Result<Void, Error>
+            do {
+                ClaudeAppController.quit()
+                guard ClaudeAppController.waitUntilQuit(timeout: 10) else {
+                    throw ProfileError.claudeDidNotQuit
+                }
+                try self.manager.saveCurrent(as: pending.name)
+                self.assignAutoColorIfNeeded(to: pending.name)
+                self.manager.clearPendingSetup()
+                ClaudeAppController.launch()
+                outcome = .success(())
+            } catch {
+                ClaudeAppController.launch()
+                outcome = .failure(error)
+            }
+            DispatchQueue.main.async {
+                self.isPreparingAccount = false
+                self.clearSwitchingUI()
+                switch outcome {
+                case .success:
+                    self.pendingSetup = nil
+                    self.viewModel.setPendingAccountName(nil)
+                    self.refreshUI()
+                    self.registerHotkeys()
+                    Dialogs.notify(
+                        title: "Added \(pending.name)",
+                        body: "Signed-in session saved. Claude is relaunching."
+                    )
+                case .failure(let error):
+                    self.refreshUI()
+                    Dialogs.alert(
+                        "Couldn't finish adding \(pending.name)",
+                        style: .critical,
+                        detail: "\(error.localizedDescription)\n\nClaude is still signed in. Press Finish to try again, or Cancel to restore \(pending.previousActive)."
+                    )
+                }
+            }
+        }
+    }
+
+    /// Abandon the new sign-in and restore the account the user started
+    /// from. Safe after a relaunch: that profile's snapshot is the only
+    /// copy of the live session.
+    @objc func handleCancelPendingAccount() {
+        guard let pending = pendingSetup, !isPreparingAccount else { return }
+        guard Dialogs.confirm(
+            title: "Cancel adding \(pending.name)?",
+            message: "Claude will quit and Swivel will restore your saved \(pending.previousActive) session. Nothing will be saved for \(pending.name).",
+            confirmTitle: "Restore \(pending.previousActive)"
+        ) else { return }
+
+        isPreparingAccount = true
+        statusItemController?.closePopover()
+        statusItem.button?.toolTip = "Restoring \(pending.previousActive)…"
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            let outcome: Result<Void, Error>
+            do {
+                ClaudeAppController.quit()
+                guard ClaudeAppController.waitUntilQuit(timeout: 10) else {
+                    throw ProfileError.claudeDidNotQuit
+                }
+                try self.manager.restorePendingSetup(previousActive: pending.previousActive)
+                ClaudeAppController.launch()
+                outcome = .success(())
+            } catch {
+                ClaudeAppController.launch()
+                outcome = .failure(error)
+            }
+            DispatchQueue.main.async {
+                self.isPreparingAccount = false
+                self.clearSwitchingUI()
+                switch outcome {
+                case .success:
+                    self.pendingSetup = nil
+                    self.viewModel.setPendingAccountName(nil)
+                    self.refreshUI()
+                    Dialogs.notify(
+                        title: "Back to \(pending.previousActive)",
+                        body: "The saved session was restored. Nothing was added for \(pending.name)."
+                    )
+                case .failure(let error):
+                    self.refreshUI()
+                    Dialogs.alert(
+                        "Couldn't restore \(pending.previousActive)",
+                        style: .critical,
+                        detail: "\(error.localizedDescription)\n\nPress Cancel to try again."
+                    )
+                }
+            }
+        }
+    }
+
+    /// Reload a setup marker left by a previous launch so Finish/Cancel are
+    /// available even if Swivel restarted mid-flow.
+    private func restorePendingSetupState() {
+        pendingSetup = manager.loadPendingSetup()
+        viewModel.setPendingAccountName(pendingSetup?.name)
+    }
+
+    /// Account-switching and snapshot mutations are unsafe while the live
+    /// Claude install is on its sign-in screen: they'd either save the
+    /// half-finished session over a good profile or strand the old one.
+    private func ensureNoAccountSetupInProgress() -> Bool {
+        if isPreparingAccount {
+            NSSound.beep()
+            return false
+        }
+        if let pending = pendingSetup {
+            Dialogs.alert(
+                "Finish adding \(pending.name) first",
+                style: .informational,
+                detail: "Use Finish or Cancel in the Swivel banner. Switching or changing accounts now would leave the half-signed-in session in place."
+            )
+            return false
+        }
+        return true
+    }
+
+    /// Auto-assign the next unused preset color so new accounts show up with
+    /// a distinct identity immediately, without a trip through the submenu.
+    private func assignAutoColorIfNeeded(to name: String) {
+        guard manager.profileColorHex(for: name) == nil else { return }
+        let used = manager.assignedColorHexes()
+        let pick = MenuStyle.colorPresets.first { !used.contains($0.hex.uppercased()) }
+            ?? MenuStyle.colorPresets.first
+        if let hex = pick?.hex {
+            try? manager.setProfileColorHex(hex, for: name)
+        }
+    }
+
     @objc func handleUpdateCurrent() {
+        guard ensureNoAccountSetupInProgress() else { return }
         guard let active = manager.activeProfile() else {
             Dialogs.alert("No active account", style: .informational,
                   detail: "Switch to an account first, then update it from Claude's current state.")
@@ -480,6 +721,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func renameProfile(_ oldName: String) {
+        guard ensureNoAccountSetupInProgress() else { return }
         guard let newName = Dialogs.prompt(
             title: "Rename \(oldName)",
             message: "Enter a new name for this account.",
@@ -500,6 +742,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func deleteProfile(_ name: String) {
+        guard ensureNoAccountSetupInProgress() else { return }
         let backupCount = manager.listBackups(for: name).count
         let backupClause = backupCount > 0
             ? " Plus \(backupCount) saved backup\(backupCount == 1 ? "" : "s") of this account will be removed."
@@ -520,6 +763,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func restoreBackup(profile: String, backupDirName backupName: String) {
+        guard ensureNoAccountSetupInProgress() else { return }
         let backups = manager.listBackups(for: profile)
         guard let backup = backups.first(where: { $0.directoryName == backupName }) else {
             Dialogs.alert("Backup not found", style: .warning)
